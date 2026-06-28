@@ -1,5 +1,6 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useEffect, useCallback, useMemo } from 'react';
 import { TERRITORY_DATA } from './territoryData.js';
+import { supabase, GAME_ROW_ID } from './supabaseClient.js';
 
 const GUILDS = [
   { id: 'g1', name: 'Guild 1', color: '#D85A30' },
@@ -30,7 +31,9 @@ function defaultState() {
 }
 
 export default function App() {
-  const [state, setState] = useState(defaultState);
+  const [state, setState] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState(null);
   const [view, setView] = useState('map');
   const [selectedGuild, setSelectedGuild] = useState(GUILDS[0].id);
   const [selectedTerritory, setSelectedTerritory] = useState(null);
@@ -51,83 +54,158 @@ export default function App() {
     return { ...s, log: [{ text, time: Date.now() }, ...s.log].slice(0, 40) };
   }
 
+  // Load initial state from Supabase
+  const loadState = useCallback(async () => {
+    try {
+      const { data, error } = await supabase
+        .from('game_state')
+        .select('data')
+        .eq('id', GAME_ROW_ID)
+        .single();
+      if (error) throw error;
+      setState(data.data);
+      setLoadError(null);
+    } catch (e) {
+      console.error('load error', e);
+      setLoadError(e.message || 'Could not load game state.');
+    }
+    setLoading(false);
+  }, []);
+
+  useEffect(() => {
+    loadState();
+  }, [loadState]);
+
+  // Subscribe to live changes from other devices
+  useEffect(() => {
+    const channel = supabase
+      .channel('game_state_changes')
+      .on(
+        'postgres_changes',
+        { event: 'UPDATE', schema: 'public', table: 'game_state', filter: `id=eq.${GAME_ROW_ID}` },
+        (payload) => {
+          setState(payload.new.data);
+        }
+      )
+      .subscribe();
+
+    return () => {
+      supabase.removeChannel(channel);
+    };
+  }, []);
+
+  // Save state to Supabase (this also triggers the realtime update for other devices)
+  async function save(newState) {
+    setState(newState); // optimistic local update
+    try {
+      const { error } = await supabase
+        .from('game_state')
+        .update({ data: newState })
+        .eq('id', GAME_ROW_ID);
+      if (error) throw error;
+    } catch (e) {
+      console.error('save error', e);
+      showToast('⚠ Could not sync — check connection');
+    }
+  }
+
   function territoryCountFor(guildId) {
     return Object.values(state.territoryOwners).filter(o => o === guildId).length;
   }
 
   function claimTerritory(territoryId, guildId) {
+    if (!state) return;
     const cost = 10;
     if (state.guildGold[guildId] < cost) return showToast('Not enough gold to claim');
     if (state.territoryOwners[territoryId]) return showToast('Territory already owned');
-    setState(s => {
-      let ns = {
-        ...s,
-        guildGold: { ...s.guildGold, [guildId]: s.guildGold[guildId] - cost },
-        territoryOwners: { ...s.territoryOwners, [territoryId]: guildId },
-      };
-      return addLog(ns, `${guildById[guildId].name} claimed ${territoryId}`);
-    });
+    let ns = {
+      ...state,
+      guildGold: { ...state.guildGold, [guildId]: state.guildGold[guildId] - cost },
+      territoryOwners: { ...state.territoryOwners, [territoryId]: guildId },
+    };
+    ns = addLog(ns, `${guildById[guildId].name} claimed ${territoryId}`);
+    save(ns);
     showToast('Claimed');
   }
 
   function adjustGold(guildId, amount) {
-    setState(s => {
-      let ns = { ...s, guildGold: { ...s.guildGold, [guildId]: Math.max(0, s.guildGold[guildId] + amount) } };
-      return addLog(ns, `${guildById[guildId].name} ${amount > 0 ? 'earned' : 'spent'} ${Math.abs(amount)} gold`);
-    });
+    if (!state) return;
+    let ns = { ...state, guildGold: { ...state.guildGold, [guildId]: Math.max(0, state.guildGold[guildId] + amount) } };
+    ns = addLog(ns, `${guildById[guildId].name} ${amount > 0 ? 'earned' : 'spent'} ${Math.abs(amount)} gold`);
+    save(ns);
   }
 
   function buildStructure(territoryId, guildId) {
+    if (!state) return;
     const cost = 15;
     if (state.territoryOwners[territoryId] !== guildId) return showToast('You do not own this territory');
     if (state.guildGold[guildId] < cost) return showToast('Not enough gold');
-    setState(s => {
-      let ns = {
-        ...s,
-        guildGold: { ...s.guildGold, [guildId]: s.guildGold[guildId] - cost },
-        territoryHP: { ...s.territoryHP, [territoryId]: Math.min(MAX_HP + 50, s.territoryHP[territoryId] + 25) },
-      };
-      return addLog(ns, `${guildById[guildId].name} fortified ${territoryId} (+25 HP)`);
-    });
+    let ns = {
+      ...state,
+      guildGold: { ...state.guildGold, [guildId]: state.guildGold[guildId] - cost },
+      territoryHP: { ...state.territoryHP, [territoryId]: Math.min(MAX_HP + 50, state.territoryHP[territoryId] + 25) },
+    };
+    ns = addLog(ns, `${guildById[guildId].name} fortified ${territoryId} (+25 HP)`);
+    save(ns);
     showToast('Structure built — +25 HP');
   }
 
   function attackTerritory(territoryId, attackerGuildId, damage) {
+    if (!state) return;
     const neighbors = NEIGHBOR_MAP[territoryId] || [];
     const adjacent = neighbors.some(n => state.territoryOwners[n] === attackerGuildId);
     if (!adjacent) return showToast('Not adjacent — cannot attack');
     const cost = 15;
     if (state.guildGold[attackerGuildId] < cost) return showToast('Not enough gold to attack');
 
-    setState(s => {
-      const defenderGuildId = s.territoryOwners[territoryId];
-      const newGold = { ...s.guildGold, [attackerGuildId]: s.guildGold[attackerGuildId] - cost };
-      const currentHP = s.territoryHP[territoryId];
-      const newHPVal = Math.max(0, currentHP - damage);
-      let ns = { ...s, guildGold: newGold, territoryHP: { ...s.territoryHP, [territoryId]: newHPVal } };
+    const defenderGuildId = state.territoryOwners[territoryId];
+    const newGold = { ...state.guildGold, [attackerGuildId]: state.guildGold[attackerGuildId] - cost };
+    const currentHP = state.territoryHP[territoryId];
+    const newHPVal = Math.max(0, currentHP - damage);
+    let ns = { ...state, guildGold: newGold, territoryHP: { ...state.territoryHP, [territoryId]: newHPVal } };
 
-      if (newHPVal <= 0) {
-        ns = {
-          ...ns,
-          territoryOwners: { ...s.territoryOwners, [territoryId]: attackerGuildId },
-          territoryHP: { ...ns.territoryHP, [territoryId]: MAX_HP },
-        };
-        ns = addLog(ns, `⚔ ${guildById[attackerGuildId].name} CAPTURED ${territoryId}!`);
-      } else {
-        ns = addLog(ns, `${guildById[attackerGuildId].name} struck ${territoryId} (${newHPVal}/${MAX_HP} HP left)`);
-      }
-      return ns;
-    });
+    if (newHPVal <= 0) {
+      ns = {
+        ...ns,
+        territoryOwners: { ...state.territoryOwners, [territoryId]: attackerGuildId },
+        territoryHP: { ...ns.territoryHP, [territoryId]: MAX_HP },
+      };
+      ns = addLog(ns, `⚔ ${guildById[attackerGuildId].name} CAPTURED ${territoryId}!`);
+    } else {
+      ns = addLog(ns, `${guildById[attackerGuildId].name} struck ${territoryId} (${newHPVal}/${MAX_HP} HP left)`);
+    }
+    save(ns);
     showToast('Attack resolved');
   }
 
   function setPhase(phase) {
-    setState(s => addLog({ ...s, phase }, `— Phase changed to ${phase.toUpperCase()} —`));
+    if (!state) return;
+    const ns = addLog({ ...state, phase }, `— Phase changed to ${phase.toUpperCase()} —`);
+    save(ns);
   }
 
   function resetAll() {
-    setState(defaultState());
+    save(defaultState());
     showToast('World reset');
+  }
+
+  if (loading) {
+    return (
+      <div style={{ minHeight: '100vh', background: '#0a0806', color: '#8a8378', display: 'flex', alignItems: 'center', justifyContent: 'center', fontFamily: 'system-ui, sans-serif' }}>
+        Loading the map...
+      </div>
+    );
+  }
+
+  if (!state) {
+    return (
+      <div style={{ minHeight: '100vh', background: '#0a0806', color: '#D85A30', display: 'flex', flexDirection: 'column', gap: '12px', alignItems: 'center', justifyContent: 'center', fontFamily: 'system-ui, sans-serif', padding: '2rem', textAlign: 'center' }}>
+        <div>Couldn't load the world. {loadError || ''}</div>
+        <button onClick={loadState} style={{ padding: '10px 20px', background: '#1a1410', color: '#e8a23c', border: '1px solid #e8a23c', borderRadius: '8px', cursor: 'pointer' }}>
+          Retry
+        </button>
+      </div>
+    );
   }
 
   const sortedGuilds = [...GUILDS].sort((a, b) => {
@@ -149,9 +227,6 @@ export default function App() {
         borderBottom: '1px solid #2a2420'
       }}>
         Phase: {state.phase === 'settle' ? 'Settle & Build' : state.phase === 'war' ? '⚔ War' : 'Ended'}
-        <div style={{ fontSize: '10px', color: '#5a5550', marginTop: '4px', textTransform: 'none', letterSpacing: 'normal' }}>
-          ⚠ Local preview only — changes won't sync between devices until Supabase is connected
-        </div>
       </div>
 
       {toast && <div style={toastStyle}>{toast}</div>}
